@@ -9,9 +9,9 @@
  *
  */
 
-#include <errno.h>
 #include <fcntl.h>
 #include <linux/fb.h>
+#include <linux/kd.h>
 #include <linux/vt.h>
 #include <signal.h>
 #include <stdio.h>
@@ -81,7 +81,7 @@ static int fb_open(const char *fb_device)
     return -1;
   }
 
-  G.addr = G.map_base + (G.scr_var.yoffset * G.scr_fix.line_length + G.scr_var.xoffset) * G.bytes_per_pixel;
+  G.addr = G.map_base + G.scr_var.yoffset * G.scr_fix.line_length + G.scr_var.xoffset * G.bytes_per_pixel;
   return fbfd;
 }
 
@@ -140,18 +140,23 @@ static void fb_drawimage(char *filename, int center)
 
   unsigned char *pixline, *ptr, *s;
   unsigned int i, j, thispix, xpos, ypos;
+  unsigned int draw_width, draw_height, crop_x, crop_y;
 
   FILE *file;
 
   file = fopen(filename, "r");
-  if (!file) return;
+  if (!file) {
+    fprintf(stderr, "Cannot open image file %s!\n", filename);
+    return;
+  }
 
   width = 0;
   height = 0;
+  max_color_val = 0;
   p = header;
-  rem = sizeof(header);
   while (!feof(file)) {
-    if (fgets(p, rem, file) == NULL) {
+    rem = sizeof(header) - (p - header);
+    if (rem <= 1 || fgets(p, rem, file) == NULL) {
       fclose(file);
       return;
     }
@@ -160,24 +165,36 @@ static void fb_drawimage(char *filename, int center)
     if (sscanf(header, "P6 %u %u %u", &width, &height, &max_color_val) == 3) break;
   }
 
-  if (width == 0 || height == 0 || max_color_val > 255) {
+  if (width == 0 || height == 0 || max_color_val == 0 || max_color_val > 255) {
     fprintf(stderr, "Not a valid PPM file!\n");
     fclose(file);
     return;
   }
 
-  if (width > G.scr_var.xres) width = G.scr_var.xres;
-  if (height > G.scr_var.yres) height = G.scr_var.yres;
+  if (width > 0xffff) {
+    fprintf(stderr, "PPM image too large!\n");
+    fclose(file);
+    return;
+  }
+
+  /* Image larger than screen is cropped, around the center if centering */
+  draw_width = width > G.scr_var.xres ? G.scr_var.xres : width;
+  draw_height = height > G.scr_var.yres ? G.scr_var.yres : height;
 
   if (center) {
-    xpos = (G.scr_var.xres - width) / 2;
-    ypos = (G.scr_var.yres - height) / 2;
+    xpos = (G.scr_var.xres - draw_width) / 2;
+    ypos = (G.scr_var.yres - draw_height) / 2;
+    crop_x = (width - draw_width) / 2;
+    crop_y = (height - draw_height) / 2;
   }
   else {
     xpos = 0;
     ypos = 0;
+    crop_x = 0;
+    crop_y = 0;
   }
 
+  /* Always read whole rows, so the file stays in sync */
   line_size = 3 * width;
   pixline = malloc(line_size);
   if (!pixline) {
@@ -185,16 +202,17 @@ static void fb_drawimage(char *filename, int center)
     return;
   }
 
-  for (j = 0; j < height; j++) {
+  for (j = 0; j < crop_y + draw_height; j++) {
 
     if (fread(pixline, 1, line_size, file) != line_size) {
-      fprintf(stderr, "Bad PPM file!");
+      fprintf(stderr, "Bad PPM file!\n");
       break;
     }
+    if (j < crop_y) continue;
 
-    s = pixline;
-    ptr = G.addr + (ypos + j) * G.scr_fix.line_length + xpos * G.bytes_per_pixel;
-    for (i = 0; i < width; i++) {
+    s = pixline + 3 * crop_x;
+    ptr = G.addr + (ypos + j - crop_y) * G.scr_fix.line_length + xpos * G.bytes_per_pixel;
+    for (i = 0; i < draw_width; i++) {
       thispix = fb_pixel_value(s[0], s[1], s[2]);
       fb_write_pixel(ptr, thispix);
       ptr += G.bytes_per_pixel;
@@ -217,10 +235,11 @@ static char wait_for_keypress(void)
   newt.c_lflag &= ~(ICANON | ECHO);
   tcsetattr(STDIN_FILENO, TCSANOW, &newt);
 
-  while (!terminate_requested) {
+  /* Any outcome ends the wait: a key, a signal (EINTR), EOF/hangup or an error */
+  c = 0;
+  if (!terminate_requested) {
     r = read(STDIN_FILENO, &c, 1);
-    if (r == 1) break;
-    if (r < 0 && errno == EINTR) break;
+    if (r != 1) c = 0;
   }
 
   tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
@@ -265,7 +284,7 @@ static unsigned short find_free_vtno(void)
 
 static void signal_handler(int signum)
 {
-  if (signum == SIGTERM) terminate_requested = 1;
+  if (signum == SIGTERM || signum == SIGINT || signum == SIGQUIT) terminate_requested = 1;
 }
 
 int main(int argc, char **argv)
@@ -306,6 +325,11 @@ int main(int argc, char **argv)
   }
 
   pid = fork();
+  if (pid < 0) {
+    fprintf(stderr, "Cannot fork!\n");
+    fb_close(fbfd);
+    return 1;
+  }
   if (pid) {
     printf("%d\n", pid);
     return 0;
@@ -314,7 +338,9 @@ int main(int argc, char **argv)
   sa.sa_flags = 0;
   sa.sa_handler = signal_handler;
   sigemptyset(&sa.sa_mask);
-  if (sigaction(SIGTERM, &sa, NULL) < 0) {
+  if (sigaction(SIGTERM, &sa, NULL) < 0 ||
+      sigaction(SIGINT, &sa, NULL) < 0 ||
+      sigaction(SIGQUIT, &sa, NULL) < 0) {
     fprintf(stderr, "Signal handler could not be set!\n");
     return 1;
   }
@@ -339,25 +365,40 @@ int main(int argc, char **argv)
   ioctl(fd, VT_WAITACTIVE, VT_POINTER(vtno));
 
   dup2(fd, STDOUT_FILENO);
-  dup2(fd, STDERR_FILENO);
 
-  write(STDOUT_FILENO, ESC "[?25l", 6);
+  if (write(STDOUT_FILENO, ESC "[?25l", 6) != 6) { /* ignore */ }
+
+  /* Stop the console from drawing text over the image */
+  ioctl(fd, KDSETMODE, KD_GRAPHICS);
 
   fb_drawfullrectangle(0, 0, G.scr_var.xres, G.scr_var.yres, color >> 16, color >> 8, color);
   fb_drawimage(filename, 1);
 
+  /* Redirect stderr only after drawing, so image errors don't land on the splash */
+  dup2(fd, STDERR_FILENO);
+
   wait_for_keypress();
 
-  write(STDOUT_FILENO, ESC "[?25h", 6);
+  ioctl(fd, KDSETMODE, KD_TEXT);
+
+  if (write(STDOUT_FILENO, ESC "[?25h", 6) != 6) { /* ignore */ }
 
   if (old_vtno) {
     ioctl(fd, VT_ACTIVATE, VT_POINTER(old_vtno));
     ioctl(fd, VT_WAITACTIVE, VT_POINTER(old_vtno));
   }
 
-  close(fd);
+  /* Release every fd on the VT, otherwise it is busy and cannot be deallocated */
+  if (fd > STDERR_FILENO) close(fd);
+  close(STDIN_FILENO);
+  close(STDOUT_FILENO);
+  close(STDERR_FILENO);
 
-  ioctl(STDIN_FILENO, VT_DISALLOCATE, VT_POINTER(vtno));
+  fd = get_vt_fd();
+  if (fd >= 0) {
+    ioctl(fd, VT_DISALLOCATE, VT_POINTER(vtno));
+    close(fd);
+  }
 
   fb_close(fbfd);
 

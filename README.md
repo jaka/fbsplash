@@ -1,12 +1,12 @@
 # fbsplash
 
-Draws given image on framebuffer and waits for a keypress.
+Draws given image full-screen on framebuffer, waits for a keypress, and then returns back to where you were. It's meant for things like boot or kiosk splash screens, and it draws straight to the framebuffer without X or Wayland.
 
 ### Usage
 ```
-./fbsplash [filename] [hexcolor]
+./fbsplash image.ppm [0xRRGGBB]
 ```
-Where hexcolor is color of pixels filling around.
+Where RRGGBB is color in hex notation of pixels filling around.
 
 ### Compiling
 ```

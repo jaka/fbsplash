@@ -1,24 +1,28 @@
-OPTS := -Os -s -std=gnu90
-CFLAGS += -Wall -Werror -Wextra -fdata-sections -ffunction-sections -fno-strict-aliasing 
+OPTS := -Os -std=gnu90
+CFLAGS += -Wall -Werror -Wextra -fdata-sections -ffunction-sections -fno-strict-aliasing
 LDFLAGS	+= -Wl,--gc-sections -static
 SFLAGS := -R .comment -R .gnu.version -R .note -R .note.ABI-tag
 
+ifeq ($(origin CC),default)
 CC = $(CROSS_COMPILE)cc
-STRIP = $(CROSS_COMPILE)strip
+endif
+STRIP ?= $(CROSS_COMPILE)strip
 
 SOURCES := $(wildcard *.c)
 OBJECTS := $(patsubst %.c,%.o,$(SOURCES))
 TARGET := fbsplash
 
+.PHONY: all clean
+
 all: $(OBJECTS) $(TARGET)
 
 %.o: %.c
-	$(CC) $(CFLAGS) $(OPTS) -c -o $@ $<
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(OPTS) -c -o $@ $<
 
 $(TARGET): $(OBJECTS)
-	$(CC) $(LDFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) $(OPTS) $(LDFLAGS) -o $@ $^
 	$(STRIP) $(SFLAGS) $@
 
 clean:
-	rm -fr $(OBJECTS)
-	rm -f $(TARGET)
+	rm -fv $(OBJECTS)
+	rm -fv $(TARGET)
